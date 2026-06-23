@@ -1,77 +1,151 @@
-# System architecture
+# Architecture
 
-This document describes the **design patterns** behind a production quantitative
-trading platform. The demo repo implements a minimal version of each layer using
-synthetic data and a placeholder strategy.
-
----
-
-## Goals
-
-| Goal | How |
-|------|-----|
-| Backtest/live parity | Same domain events and reducers; only adapters differ |
-| Testable core | Strategy and risk are pure; no broker I/O in domain logic |
-| Swappable models | `ModelLayer` protocol — rule engine or trained classifier |
-| Auditability | Typed events, versioned ML artifacts, structured deny reasons |
-| Low operational cost | Single process, file-based storage until scale is proven |
+Design of an event-driven quantitative trading platform. The demo implements each
+layer with synthetic data and placeholder strategies; the layer contracts match
+the production system.
 
 ---
 
-## Core idea: one event spine, multiple adapters
+## Pipeline
 
-```mermaid
-flowchart LR
-  subgraph ingest["Ingest adapters"]
-    HIST["Historical files"]
-    LIVE["Live stream"]
-  end
-  subgraph core["Core engine"]
-    NORM["Normalizer → BarClosed"]
-    STR["Strategy → Intent"]
-    RISK["Risk → OrderCommand"]
-    EXEC["Execution → Fills"]
-    LOG["Logs + feature store"]
-  end
-  HIST --> NORM
-  LIVE --> NORM
-  NORM --> STR
-  STR --> RISK
-  RISK --> EXEC
-  STR --> LOG
-  EXEC --> LOG
+```
+┌─────────────┐    ┌─────────────────┐    ┌───────────┐    ┌───────────────────┐
+│  Live data  │───▶│ Feature builder │───▶│ ML layer  │───▶│ Trade construction│
+│  (or replay)│    │                 │    │           │    │                   │
+└─────────────┘    └─────────────────┘    └───────────┘    └─────────┬─────────┘
+                                                                       │
+     ┌─────────────────────────────────────────────────────────────────┘
+     ▼
+┌─────────────┐    ┌─────────────┐    ┌──────────────────────────────────────────┐
+│ Risk engine │───▶│  Execution  │───▶│ State projection + reconciliation      │
+│             │    │  (sim/live) │    │ (bracket state machine, broker-wins)   │
+└─────────────┘    └─────────────┘    └──────────────────────────────────────────┘
 ```
 
-- **Backtest:** a `BarFeed` replays `BarClosed` events in time order.
-- **Live:** a stream adapter emits the same `BarClosed` types (plus reconnect semantics).
+| Stage | Module | Output |
+|-------|--------|--------|
+| Live data | `engine/bar_feed.py`, live stream adapter | `BarClosed` |
+| Feature builder | strategy / factor pipeline | `FeatureRow` |
+| ML layer | `engine/model_layer.py` | `Prediction` (direction + confidence) |
+| Trade construction | `engine/trade_constructor.py` | `TradeSpec` (entry, SL, TP, size) |
+| Risk engine | `risk.py` | `OrderCommand` or deny |
+| Execution | `execution/sim_broker.py` | `FillLeg`, `OrderDone` |
+| State + reconcile | `runner/state_reducers.py`, `runner/reconciliation.py` | `TradingState` |
 
-The strategy module is **not** rewritten for production.
-
----
-
-## Runner (orchestration shell)
-
-`runner/pipeline_runner.py` is the **single loop** that wires modular components:
-
-1. `BarFeed` emits `BarClosed`
-2. `Strategy.on_bar()` → `StrategyIntent`
-3. `risk.evaluate()` → `OrderCommand` or deny
-4. `SimBroker` (or live IBKR adapter) → `FillLeg` / `OrderDone`
-5. `state_reducers` project `TradingState` (including bracket state machine)
-6. `reconciliation` monitors position drift and rolling SL ratio
-
-`runner/strategy_factory.py` builds the strategy plug-in from `RunnerConfig`.
-Live production replaces only step 4.
-
-See [state-machines.md](state-machines.md) for the `PositionGroup` lifecycle.
+The **runner** (`runner/pipeline_runner.py`) is the shell that wires these stages
+in a single event loop. Live production swaps the execution adapter; everything
+upstream stays the same.
 
 ---
 
-1. **Domain** (no I/O): events, position model, risk rules, feature contracts.
-2. **Application**: run loop, session policy, state reducers, correlation IDs.
-3. **Infrastructure**: broker client, parquet I/O, configuration, secrets.
+## Design decisions
 
-**Rule:** strategy and risk decisions must be testable without a broker.
+### Why decouple the ML layer from trade construction
+
+The ML layer answers one question: *is this a good entry, and with what
+confidence?* It emits a `Prediction` — direction and a score — and nothing else.
+
+Trade construction answers a different question: *given an entry decision, what are
+the prices and size?* It produces a `TradeSpec` — entry, stop-loss, take-profit,
+contract count — using structural rules (magnet levels, fixed point offsets,
+session risk budget). These rules are domain knowledge that should not be
+re-learned on every model retrain.
+
+```
+FeatureRow → ModelLayer → Prediction → TradeConstructor → TradeSpec → Risk → Execution
+              "trade?"     direction      "where & how much?"   prices/size
+                           + confidence
+```
+
+**What this buys you:**
+
+- Swap LightGBM for a rule engine without touching SL/TP logic or execution.
+- Retrain on new features without risking accidental changes to position sizing.
+- Test the model (classification metrics) and the trade structure (PnL simulation)
+  independently.
+- Keep labels clean: `target_*` columns describe outcomes; the model never sees
+  prices it shouldn't know at decision time.
+
+### Why immutable domain events
+
+Every fact in the system — bar close, strategy intent, risk-approved order, fill,
+terminal order state — is an immutable dataclass appended to the event spine.
+
+**Why:**
+
+- **Replay:** rebuild `TradingState` from the log after a crash or for regression tests.
+- **Audit:** answer "why did we send this order?" from typed facts, not unstructured logs.
+- **Parity:** backtest and live run the same reducer code against the same event types.
+- **No hidden mutation:** strategy code cannot silently change broker state; only
+  designated reducers update `TradingState`.
+
+Events carry a `schema_version` for forward-compatible persistence.
+
+### Why explicit bracket state machines
+
+A bracket order is not one order — it is a **group** of three legs (entry, TP, SL)
+with a defined lifecycle. Without an explicit state machine, it is easy to end up
+with orphaned stop orders, double exits, or ambiguous "are we in a trade?" state
+after a reconnect.
+
+```
+ENTRY_PENDING ──fill──▶ ENTRY_FILLED ──TP──▶ CLOSED_TP
+       │                      │
+       │                      └──SL──▶ CLOSED_SL
+       ├──cancel──▶ CLOSED_CANCEL
+       └──timeout─▶ CLOSED_TIMEOUT
+```
+
+States live in `lifecycle.py` (`PositionGroupStatus`) with `VALID_TRANSITIONS`
+and `assert_transition()` guards. Reducers in `runner/state_reducers.py` are the
+only code allowed to move a group between states.
+
+**Why:**
+
+- Makes illegal transitions (e.g. `ENTRY_PENDING` → `CLOSED_TP`) a hard error.
+- Gives the runner a single place to reason about "can we accept a new signal?"
+- Mirrors broker OCA semantics: one protective leg fill cancels the sibling.
+- Survives restarts: state is reconstructed from events, not in-memory flags.
+
+### Why broker-wins reconciliation
+
+Internal `TradingState` is a **projection** — a best-effort model of what the
+broker holds. After a disconnect, partial fill, or race between callbacks, the
+projection can drift.
+
+Reconciliation treats the broker snapshot as authoritative:
+
+- Compare internal position qty to `AccountSnapshot`; alert on drift.
+- Monitor rolling SL ratio across closed brackets as a live risk signal.
+- Halt or flatten when thresholds breach (configurable; paper vs live policy differs).
+
+**Why:**
+
+- Logs lie; brokers don't. Position and cash must come from the broker API.
+- Catching drift early prevents stacking orders on a position you don't think you have.
+- Separates "strategy logic broke" from "infrastructure desynced" in post-mortems.
+
+### Why risk is the only order gate
+
+Strategy emits `StrategyIntent` — a hint. Risk emits `OrderCommand` — an
+instruction. Execution talks to the broker.
+
+**Why:**
+
+- Tuning signal parameters cannot accidentally submit live orders.
+- Risk rules (kill switch, max position, daily loss, per-bar rate cap) are enforced
+  in one pure, testable function: `risk.evaluate()`.
+- Denials carry structured reason codes for logging and analysis.
+
+### Why separate market state from trading state
+
+| Container | Source | Who writes |
+|-----------|--------|------------|
+| `MarketState` | Feed + calendar | Reducers from `BarClosed` |
+| `TradingState` | Risk + execution events | Reducers from orders/fills |
+
+Strategy reads `MarketState` and emits intents. It never writes open orders or
+position directly.
 
 ---
 
@@ -79,97 +153,152 @@ See [state-machines.md](state-machines.md) for the `PositionGroup` lifecycle.
 
 | Event | Role |
 |-------|------|
-| `BarClosed` | Primary driver; one closed bar per timeframe |
-| `SessionBoundary` | Session open/close markers |
-| `StrategyIntent` | Strategy output — **not** a broker order |
-| `OrderCommand` | Risk-approved instruction to execution |
-| `FillLeg` | One fill leg; idempotent on `fill_id` |
+| `BarClosed` | Closed bar; primary strategy driver |
+| `SessionBoundary` | Session open / close |
+| `StrategyIntent` | Strategy output — not a broker order |
+| `OrderCommand` | Risk-approved instruction |
+| `FillLeg` | One fill; idempotent on `fill_id` |
 | `OrderDone` | Terminal order state |
-
-Events are immutable dataclasses with a `schema_version` field for forward-compatible persistence.
-
----
-
-## Market state vs trading state
-
-| Container | Updated by | Purpose |
-|-----------|------------|---------|
-| `MarketState` | Feed + calendar | Rolling bars, session flags — strategy **reads** |
-| `TradingState` | Risk + execution | Open orders, position, risk counters — **authoritative** |
-
-Splitting these keeps strategy logic from mutating broker state directly.
+| `AccountSnapshot` | Broker position for reconciliation |
+| `AttemptLifecycleUpdate` | Runner → strategy bookkeeping |
 
 ---
 
-## ML pipeline boundaries
+## Runner
 
-Three hand-off points enforce separation of concerns:
+`runner/pipeline_runner.py` orchestrates one bar at a time:
 
-```
-FactorPipeline → FeatureRow → ModelLayer → Prediction → TradeConstructor → TradeSpec
-```
+1. `BarFeed` → `BarClosed`
+2. `Strategy.on_bar()` → `StrategyIntent`
+3. `risk.evaluate()` → allow / deny
+4. `SimBroker` → fills and bracket events
+5. `state_reducers` → update `TradingState` and `PositionGroup` status
+6. `reconciliation` → drift and SL-ratio checks
 
-| Type | Contains | Must not contain |
-|------|----------|------------------|
-| `FeatureRow` | Normalised features at decision time | Future prices, labels |
-| `Prediction` | Direction + confidence | Entry, SL, TP prices |
-| `TradeSpec` | Complete trade description | Mutable broker state |
-
-**Why split prediction from trade construction?**
-
-- The model answers: *should we trade, and with what confidence?*
-- The constructor answers: *where are entry, SL, and TP?* using structural rules.
-
-This lets you swap a rule engine for LightGBM without touching risk or execution.
+`runner/strategy_factory.py` selects the strategy plug-in from config.
 
 ---
 
-## Risk engine
+## Bracket state machine (detail)
 
-Only the risk engine may emit `OrderCommand`.
-
-```
-StrategyIntent + TradingState + RiskConfig → Allow(OrderCommand) | Deny(reason)
+```mermaid
+stateDiagram-v2
+    [*] --> ENTRY_PENDING: risk approves entry
+    ENTRY_PENDING --> ENTRY_FILLED: entry fill, submit OCA TP+SL
+    ENTRY_PENDING --> CLOSED_CANCEL: entry cancelled
+    ENTRY_PENDING --> CLOSED_TIMEOUT: session flatten
+    ENTRY_FILLED --> CLOSED_TP: TP filled
+    ENTRY_FILLED --> CLOSED_SL: SL filled
+    ENTRY_FILLED --> CLOSED_TIMEOUT: force flat
+    CLOSED_TP --> [*]
+    CLOSED_SL --> [*]
+    CLOSED_CANCEL --> [*]
+    CLOSED_TIMEOUT --> [*]
 ```
 
-Typical rules (evaluated in order):
+| Status | Meaning |
+|--------|---------|
+| `ENTRY_PENDING` | Entry limit working |
+| `ENTRY_FILLED` | In position; TP + SL active (OCA group) |
+| `CLOSED_TP` | Take-profit hit |
+| `CLOSED_SL` | Stop-loss hit |
+| `CLOSED_CANCEL` | Entry never filled |
+| `CLOSED_TIMEOUT` | Force-closed at session end |
 
-1. Kill switch
-2. Max position
-3. Max open orders
-4. Daily loss limit
-5. Per-bar order rate cap
-
-Denials carry structured reason codes for logging and post-mortems.
-
----
-
-## Backtest design
-
-- Strategy sees bars only up to the current timestamp (no lookahead).
-- Fill simulation may scan forward bars **after** the intent — that is execution modeling, not strategy leakage.
-- `FeatureLogger` emits one `FeatureRow` per bar regardless of signal — training data for offline ML.
+Code: `lifecycle.py`, `state.py`, `runner/state_reducers.py`, `execution/sim_broker.py`.
 
 ---
 
-## Production extensions (not in this demo)
+## ML pipeline (offline)
 
-The private production system adds:
+Training is a separate subsystem from the live runner. The live system logs
+`FeatureRow` records; offline training produces versioned models for the ML layer.
 
-- IBKR TWS integration (bar stream, bracket orders, reconciliation)
+### Training flow
+
+```
+Config JSON
+    ├── load & clean dataset
+    ├── temporal split (train / val / test by date)
+    ├── feature selection
+    ├── train
+    ├── evaluate
+    └── register → models/v001/
+```
+
+Each registered version includes `model.pkl`, `config.json`, `features.json`,
+`metrics.json`, and `metadata.json` — full lineage for any inference result.
+
+### Dataset contract
+
+| Prefix | Usage |
+|--------|-------|
+| `feature_*` | Model input — known at decision time only |
+| `target_*` | Labels — future outcomes, never used as features |
+| `id_*` | Join / dedup keys |
+| `audit_*` | Timestamps for human review |
+
+Temporal splits are date-based, not random shuffle. Walk-forward evaluation is
+the production pattern for out-of-sample estimates; the demo uses hold-out splits.
+
+### Live integration point
+
+```python
+from quant_demo.ml.predict import MLPredictor
+
+predictor = MLPredictor(registry_dir="models", version="v001")
+should_trade, prob = predictor.should_trade(features_dict, threshold=0.55)
+```
+
+Sits after feature extraction, before the risk engine — same position as the
+in-process `ModelLayer` protocol used by `ml_pipeline_strategy.py`.
+
+---
+
+## Backtest vs live
+
+| Concern | Backtest | Live |
+|---------|----------|------|
+| Data adapter | `BarFeed` parquet replay | IBKR bar stream |
+| Execution | `SimBroker` | IBKR TWS bracket orders |
+| Orchestration | `pipeline_runner.py` | same runner loop |
+| State reducers | same | same |
+| Events | same | same |
+
+Strategy sees bars only up to the current timestamp. Fill simulation may scan
+forward bars after an intent — that is execution modeling, not strategy lookahead.
+
+---
+
+## Module map
+
+```
+quant_demo/
+├── lifecycle.py              PositionGroupStatus, VALID_TRANSITIONS
+├── events.py                 domain events
+├── state.py                  MarketState, TradingState, PositionGroup
+├── risk.py                   intent → OrderCommand | deny
+├── runner/
+│   ├── pipeline_runner.py    orchestration shell
+│   ├── state_reducers.py     pure TradingState projections
+│   ├── reconciliation.py     broker-wins checks
+│   ├── strategy_factory.py
+│   └── config.py
+├── execution/sim_broker.py   simulated OCA brackets
+├── engine/
+│   ├── features.py           FeatureRow, Prediction, TradeSpec
+│   ├── model_layer.py        ModelLayer protocol
+│   └── trade_constructor.py
+├── strategies/               plug-in strategies (placeholder logic)
+└── ml/                       offline training + registry
+```
+
+---
+
+## Production extensions (private repo)
+
+- IBKR TWS integration with reconnect and session calendar
 - Multi-timeframe bar aggregation
-- CME session calendar and close-buffer flatten
 - Golden parity tests between replay and live
-- Versioned model registry with walk-forward backtest
-
-This demo implements the **same layer contracts** with simulated execution.
-
----
-
-## Design principles for interviews
-
-1. **Events over callbacks** — replay, audit, and test from a log.
-2. **Protocols over inheritance** — `Strategy` and `ModelLayer` are plug-in contracts.
-3. **Pure reducers** — risk and state updates are deterministic given inputs.
-4. **Config-driven ML** — one JSON describes an entire training run.
-5. **Temporal discipline** — train/val/test splits by date, never random shuffle on time series.
+- Walk-forward P&L backtest on registered models
+- Close-buffer flatten and startup position policy
