@@ -1,0 +1,14 @@
+{
+  "description": "Demo logistic regression on synthetic feature table",
+  "dataset": {
+    "parquet_path": "data/synthetic/ml_demo_table.parquet",
+    "target_column": "target_win",
+    "train_end": "2025-03-31",
+    "val_end": "2025-04-30"
+  },
+  "model": {
+    "algorithm": "logistic_regression",
+    "max_features": 4,
+    "class_weight": "balanced"
+  }
+}
