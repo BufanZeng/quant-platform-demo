@@ -49,7 +49,23 @@ The strategy module is **not** rewritten for production.
 
 ---
 
-## Layered architecture
+## Runner (orchestration shell)
+
+`runner/pipeline_runner.py` is the **single loop** that wires modular components:
+
+1. `BarFeed` emits `BarClosed`
+2. `Strategy.on_bar()` → `StrategyIntent`
+3. `risk.evaluate()` → `OrderCommand` or deny
+4. `SimBroker` (or live IBKR adapter) → `FillLeg` / `OrderDone`
+5. `state_reducers` project `TradingState` (including bracket state machine)
+6. `reconciliation` monitors position drift and rolling SL ratio
+
+`runner/strategy_factory.py` builds the strategy plug-in from `RunnerConfig`.
+Live production replaces only step 4.
+
+See [state-machines.md](state-machines.md) for the `PositionGroup` lifecycle.
+
+---
 
 1. **Domain** (no I/O): events, position model, risk rules, feature contracts.
 2. **Application**: run loop, session policy, state reducers, correlation IDs.

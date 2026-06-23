@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a demo backtest on synthetic bars."""
+"""Run a demo backtest via the modular pipeline runner."""
 
 from __future__ import annotations
 
@@ -9,8 +9,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from quant_demo.engine.backtest import run_backtest
 from quant_demo.engine.bar_feed import BarFeed
+from quant_demo.runner.config import RunnerConfig
+from quant_demo.runner.pipeline_runner import run_pipeline
 from quant_demo.strategies.sma_crossover import SMACrossoverStrategy
 
 DATA = ROOT / "data" / "synthetic" / "demo_bars.parquet"
@@ -21,9 +22,10 @@ def main() -> None:
         print("Synthetic data not found. Run: python scripts/generate_synthetic_data.py")
         sys.exit(1)
 
+    cfg = RunnerConfig(data_path=DATA)
     strategy = SMACrossoverStrategy()
     feed = BarFeed.from_parquet(DATA)
-    result = run_backtest(strategy, feed)
+    result = run_pipeline(strategy, feed, cfg)
     result.print_summary()
     print(f"Feature rows logged: {len(strategy.feature_log)}")
 

@@ -1,52 +1,47 @@
 # Quant Platform Demo
 
 A **public, sanitized showcase** of an event-driven quantitative trading platform.
-This repository demonstrates system design, layered architecture, and ML pipeline
-patterns — without proprietary signal logic, broker credentials, or production data.
+This repository demonstrates system design, layered architecture, state machines,
+and ML pipeline patterns — without proprietary signal logic or production data.
 
-> **Note:** The production system (live broker integration, proprietary strategies,
-> and labeled datasets) is private. This repo is the architecture and engineering
-> story you can share on a resume or in interviews.
+> **Note:** The production system (live IBKR integration, proprietary strategies,
+> and labeled datasets) is private. This repo is the architecture story for
+> resumes and technical interviews.
 
-## What this demonstrates
+## What a tech lead should see here
 
-| Layer | Demo implementation |
-|-------|---------------------|
-| Event spine | `BarClosed` → strategy → risk → simulated execution |
-| Strategy plug-in | `Strategy` protocol with a placeholder SMA crossover |
-| ML boundary | `FeatureRow` → `ModelLayer` → `Prediction` → `TradeSpec` |
-| Risk gate | Pure function: intent → allow/deny + `OrderCommand` |
-| ML ops | Config-driven training, temporal split, versioned model registry |
-| Tests | Risk engine, pipeline layers, end-to-end backtest smoke |
+| Design choice | Where to look |
+|---------------|---------------|
+| **Bracket state machine** | `src/quant_demo/lifecycle.py`, `docs/state-machines.md` |
+| **Runner / orchestration shell** | `src/quant_demo/runner/pipeline_runner.py` |
+| **Pure state reducers** | `src/quant_demo/runner/state_reducers.py` |
+| **Broker adapter swap point** | `src/quant_demo/execution/sim_broker.py` |
+| **Protocol-based plug-ins** | `strategy_protocol.py`, `engine/model_layer.py` |
+| **Risk as sole order gate** | `src/quant_demo/risk.py` |
+| **Broker-wins reconciliation** | `src/quant_demo/runner/reconciliation.py` |
+| **ML ops** | `src/quant_demo/ml/`, `configs/ml_demo.json` |
 
-## Architecture (one diagram)
+## Architecture
 
 ```
-BarClosed (synthetic CSV or parquet replay)
+BarClosed
   │
-  ▼ Factor / feature builder     strategies/sma_crossover.py
-  │  rolling indicators, session context
+  ▼ Strategy (plug-in)           strategies/sma_crossover.py | ml_pipeline_strategy.py
+  │  FeatureRow → ModelLayer → Prediction → TradeSpec
   │
-  ▼ FeatureRow                   engine/features.py
-  │  flat, parquet-serialisable
+  ▼ Risk gate                    risk.py  (only layer that emits OrderCommand)
   │
-  ▼ ModelLayer (Protocol)        engine/model_layer.py
-  │  Demo: ThresholdClassifier (rule-based)
-  │  Prod pattern: swap in trained sklearn / LightGBM
+  ▼ Execution adapter            execution/sim_broker.py  (live: IBKR)
+  │  FillLeg / OrderDone → state reducers
   │
-  ▼ Prediction                   direction + confidence only
+  ▼ TradingState projection      runner/state_reducers.py
+  │  PositionGroup state machine (ENTRY_PENDING → … → CLOSED_*)
   │
-  ▼ TradeConstructor             engine/trade_constructor.py
-  │  structural SL/TP from config (not from the model)
-  │
-  ▼ Risk Gate                    risk.py
-  │  position caps, daily loss, kill switch
-  │
-  ▼ Simulated execution          engine/backtest.py
+  ▼ Reconciliation monitors      runner/reconciliation.py
 ```
 
-Backtest and live trading share the **same event types and pipeline layers**;
-only the data adapter changes (parquet replay vs broker stream).
+Backtest and live share the **same runner and event types**; only the execution
+adapter changes.
 
 ## Quick start
 
@@ -54,16 +49,15 @@ only the data adapter changes (parquet replay vs broker stream).
 python -m venv .venv
 .venv\Scripts\pip install -e ".[dev]"
 
-# Generate synthetic OHLCV bars
 python scripts/generate_synthetic_data.py
 
-# Run placeholder strategy backtest
-python scripts/run_backtest.py
+# Full pipeline runner (recommended)
+python scripts/run_pipeline.py
+python scripts/run_pipeline.py --strategy ml_pipeline
 
-# Train a demo ML model on synthetic labels
+# ML training
 python scripts/ml/run_pipeline.py --config configs/ml_demo.json
 
-# Run tests
 pytest
 ```
 
@@ -72,35 +66,35 @@ pytest
 ```
 quant-platform-demo/
 ├── docs/
-│   ├── architecture.md      # system design (read this first)
-│   └── ml-pipeline.md       # offline training + registry design
+│   ├── architecture.md
+│   ├── state-machines.md      # bracket lifecycle diagram
+│   └── ml-pipeline.md
 ├── src/quant_demo/
-│   ├── events.py            # domain events
-│   ├── state.py             # market vs trading state
-│   ├── risk.py              # pure risk engine
-│   ├── strategy_protocol.py # Strategy plug-in contract
-│   ├── engine/              # backtest, features, model layer
-│   ├── strategies/          # demo strategies (not proprietary)
-│   └── ml/                  # versioned training pipeline
-├── scripts/
-│   ├── generate_synthetic_data.py
-│   ├── run_backtest.py
-│   └── ml/run_pipeline.py
-├── configs/ml_demo.json
-├── data/synthetic/          # generated demo bars + ML table
+│   ├── lifecycle.py           # PositionGroupStatus + VALID_TRANSITIONS
+│   ├── events.py              # immutable domain events
+│   ├── state.py               # MarketState vs TradingState
+│   ├── risk.py
+│   ├── runner/
+│   │   ├── pipeline_runner.py # orchestration shell
+│   │   ├── state_reducers.py
+│   │   ├── reconciliation.py
+│   │   ├── strategy_factory.py
+│   │   └── config.py
+│   ├── execution/
+│   │   └── sim_broker.py      # simulated OCA brackets
+│   ├── engine/                # features, model layer, trade constructor
+│   ├── strategies/
+│   └── ml/
 └── tests/
+    ├── test_state_machine.py
+    ├── test_state_reducers.py
+    └── test_pipeline_runner.py
 ```
-
-## What is intentionally excluded
-
-- Proprietary entry/exit rules and factor definitions
-- Real market data and performance metrics
-- Broker API credentials and live execution code
-- Production configs and labeled datasets
 
 ## Documentation
 
 - [System architecture](docs/architecture.md)
+- [Bracket state machines](docs/state-machines.md)
 - [ML pipeline design](docs/ml-pipeline.md)
 
 ## License

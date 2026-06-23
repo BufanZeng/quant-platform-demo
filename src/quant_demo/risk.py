@@ -81,5 +81,7 @@ def evaluate(
         qty=qty,
         limit_price=float(entry_price) if entry_price is not None else None,
         signal_id=intent.signal_id,
+        position_group_id=f"grp-{intent.signal_id}",
+        oca_group=f"grp-{intent.signal_id}",
     )
     return Allow(commands=[cmd])
